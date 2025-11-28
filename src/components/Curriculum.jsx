@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { Loader2, Sparkles, Target, TrendingUp, Check } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { Loader2, Sparkles, Target, TrendingUp, Check, RefreshCw } from 'lucide-react';
 import { generateCurriculum } from '../api/gemini';
 import { db } from '../firebase';
 import { collection, query, where, getDocs, addDoc, updateDoc, doc } from 'firebase/firestore';
@@ -11,9 +11,18 @@ export default function Curriculum({ profileData, userId, onPostSaved }) {
   const [loading, setLoading] = useState(true);
   const [selectedStep, setSelectedStep] = useState(null);
   const [curriculumDocId, setCurriculumDocId] = useState(null);
+  const isGeneratingRef = useRef(false); // 중복 생성 방지 플래그
+  const abortControllerRef = useRef(null); // 취소 컨트롤러
 
   useEffect(() => {
     loadCurriculum();
+    
+    // cleanup: 컴포넌트 언마운트 시 진행 중인 작업 취소
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
   }, [userId]);
 
   const loadCurriculum = async () => {
@@ -76,11 +85,10 @@ export default function Curriculum({ profileData, userId, onPostSaved }) {
         allStepsCompleted
       });
 
-      // 모든 스텝이 완료되면 새 커리큘럼 생성
+      // 자동 생성 제거: 사용자가 완료된 커리큘럼을 클릭할 때만 새 커리큘럼 생성
+      // 모든 스텝이 완료되면 사용자에게 알림만 표시
       if (allStepsCompleted) {
-        console.log('✅ 모든 스텝 완료! 새 커리큘럼 생성 시작');
-        // 완료된 스텝 정보를 전달하여 새 커리큘럼 생성 (다음 번호부터 시작)
-        await generateNewCurriculum(newCompletedSteps);
+        console.log('✅ 모든 스텝 완료! 완료된 커리큘럼을 클릭하면 새 로드맵이 생성됩니다.');
       }
     } catch (error) {
       console.error('스텝 완료 처리 오류:', error);
@@ -88,8 +96,38 @@ export default function Curriculum({ profileData, userId, onPostSaved }) {
     }
   };
 
+  // 완료된 커리큘럼 클릭 시 새 커리큘럼 생성
+  const handleCompletedStepClick = async () => {
+    // 이미 생성 중이면 중복 호출 방지
+    if (loading) {
+      console.log('⚠️ 이미 커리큘럼 생성 중입니다.');
+      return;
+    }
+
+    // 모든 스텝이 완료되었는지 확인
+    const allStepsCompleted = curriculum && curriculum.length > 0 && curriculum.every(step => 
+      completedSteps.includes(step.step)
+    );
+
+    if (allStepsCompleted && completedSteps.length > 0) {
+      console.log('✅ 완료된 커리큘럼 클릭! 새 커리큘럼 생성 시작');
+      await generateNewCurriculum(completedSteps);
+    }
+  };
+
   const generateNewCurriculum = async (allCompletedSteps = []) => {
+    // 중복 생성 방지
+    if (isGeneratingRef.current) {
+      console.log('⚠️ 이미 커리큘럼 생성 중입니다. 중복 호출 무시.');
+      return;
+    }
+
+    // AbortController 생성
+    abortControllerRef.current = new AbortController();
+    const signal = abortControllerRef.current.signal;
+
     try {
+      isGeneratingRef.current = true;
       console.log('🔄 새 커리큘럼 생성 시작');
       console.log('완료된 스텝:', allCompletedSteps);
       console.log('프로필 데이터:', profileData);
@@ -100,17 +138,19 @@ export default function Curriculum({ profileData, userId, onPostSaved }) {
       // completedSteps를 전달하면 다음 번호부터 시작 (예: 1-5 완료 시 6부터 시작)
       const newSteps = await generateCurriculum(profileData, allCompletedSteps);
       
+      // 취소되었는지 확인
+      if (signal.aborted) {
+        console.log('⚠️ 커리큘럼 생성이 취소되었습니다.');
+        return;
+      }
+      
       console.log('✅ 생성된 새 커리큘럼:', newSteps);
       
       if (!newSteps || newSteps.length === 0) {
         throw new Error('커리큘럼 생성 실패: 빈 배열 반환');
       }
-      
-      // 상태 업데이트
-      setCurriculum(newSteps);
-      setCompletedSteps([]);
 
-      // Firebase 업데이트
+      // Firebase 업데이트를 먼저 완료 (중요: 상태 업데이트 전에 Firebase 저장)
       if (curriculumDocId) {
         await updateDoc(doc(db, 'curriculums', curriculumDocId), {
           steps: newSteps,
@@ -132,14 +172,32 @@ export default function Curriculum({ profileData, userId, onPostSaved }) {
         console.log('✅ 새 커리큘럼 문서 생성 완료:', docRef.id);
       }
       
+      // 취소되었는지 다시 확인
+      if (signal.aborted) {
+        console.log('⚠️ Firebase 저장 후 취소되었습니다.');
+        return;
+      }
+      
+      // Firebase 저장 완료 후 상태 업데이트
+      setCurriculum(newSteps);
+      setCompletedSteps([]);
+      
       alert('모든 스텝을 완료했습니다! 새로운 로드맵이 생성되었습니다.');
       console.log('🎉 새 커리큘럼 생성 및 저장 완료!');
     } catch (error) {
+      // 취소된 경우는 에러로 처리하지 않음
+      if (signal.aborted) {
+        console.log('⚠️ 작업이 취소되었습니다.');
+        return;
+      }
+      
       console.error('❌ 새 커리큘럼 생성 오류:', error);
       console.error('에러 상세:', error.stack);
       alert(`새 커리큘럼 생성 중 오류가 발생했습니다: ${error.message}`);
     } finally {
       setLoading(false);
+      isGeneratingRef.current = false; // 생성 완료 후 플래그 해제
+      abortControllerRef.current = null;
     }
   };
 
@@ -177,14 +235,28 @@ export default function Curriculum({ profileData, userId, onPostSaved }) {
         <div className="space-y-3">
           {curriculum && curriculum.map((step, index) => {
             const isCompleted = completedSteps.includes(step.step);
+            const allStepsCompleted = curriculum && curriculum.length > 0 && curriculum.every(s => 
+              completedSteps.includes(s.step)
+            );
+            
+            // 완료된 스텝 클릭 핸들러: 모든 스텝이 완료되었을 때만 새 커리큘럼 생성
+            const handleClick = () => {
+              if (isCompleted && allStepsCompleted) {
+                handleCompletedStepClick();
+              } else if (!isCompleted) {
+                setSelectedStep(step);
+              }
+            };
             
             return (
               <div
                 key={step.step}
-                onClick={() => !isCompleted && setSelectedStep(step)}
+                onClick={handleClick}
                 className={`group relative p-5 bg-gradient-to-r from-gray-50 to-white border-l-4 rounded-lg transition-all ${
                   isCompleted 
-                    ? 'border-green-500 opacity-60 cursor-not-allowed' 
+                    ? allStepsCompleted
+                      ? 'border-green-500 cursor-pointer hover:shadow-md hover:opacity-80' 
+                      : 'border-green-500 opacity-60 cursor-not-allowed'
                     : 'border-purple-500 cursor-pointer hover:shadow-md'
                 }`}
               >
@@ -220,6 +292,34 @@ export default function Curriculum({ profileData, userId, onPostSaved }) {
             );
           })}
         </div>
+
+        {/* 모든 스텝 완료 시 새 로드맵 생성 버튼 */}
+        {curriculum && curriculum.length > 0 && curriculum.every(step => 
+          completedSteps.includes(step.step)
+        ) && (
+          <div className="mt-6 pt-6 border-t border-gray-200">
+            <button
+              onClick={handleCompletedStepClick}
+              disabled={loading || isGeneratingRef.current}
+              className="w-full flex items-center justify-center gap-2 px-6 py-4 bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-lg font-semibold hover:from-purple-600 hover:to-pink-600 transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-lg hover:shadow-xl"
+            >
+              {loading || isGeneratingRef.current ? (
+                <>
+                  <Loader2 className="w-5 h-5 animate-spin" />
+                  <span>새 로드맵 생성 중...</span>
+                </>
+              ) : (
+                <>
+                  <RefreshCw className="w-5 h-5" />
+                  <span>새 로드맵 생성하기</span>
+                </>
+              )}
+            </button>
+            <p className="text-sm text-gray-500 text-center mt-3">
+              모든 스텝을 완료했습니다! 새로운 로드맵을 생성하시겠어요?
+            </p>
+          </div>
+        )}
       </div>
 
       {selectedStep && (
